@@ -3,11 +3,13 @@
 ## システム概要
 
 Invest Analyzerは、株価データの管理と予測値の保存を目的としたDjangoアプリケーションです。
+
 Dockerを利用してDjangoのWebサーバとMySQLデータベースをコンテナで構築しました。
 
 ## 注意事項
 
 本アプリは機械学習の学習を目的として開発されたものであり、株価予測の結果について一切の保証はいたしかねます。
+
 株の売買や投資の判断は、ご自身の責任でお願いいたします。
 
 ### 主な機能
@@ -59,14 +61,19 @@ docker-compose exec web python manage.py createsuperuser
 ```
 
 ブラウザでDjangoアプリにアクセス
+
 アプリ本体
+
 http://localhost:8000/
 
+
 管理画面
+
 http://localhost:8000/admin/
 
 
 MySQLデータベースに接続する方法
+
 MySQLのコンテナ内に入ってSQL操作したい場合：
 ```bash
 docker-compose exec db mysql -u user -p
@@ -74,7 +81,9 @@ docker-compose exec db mysql -u user -p
 パスワードは.envのDB_PASSWORDに設定したものを入力してください。
 
 
+
 コンテナ停止・再起動
+
 開発環境を停止したい場合：
 ```bash
 docker-compose down -v
