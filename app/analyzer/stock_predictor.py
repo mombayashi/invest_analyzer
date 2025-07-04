@@ -61,11 +61,11 @@ def predict(symbol):
     # 損失関数（MSE以外にもL1Loss, HuberLossなど試せる）
     criterion = nn.MSELoss()
 
-    # 最適化手法（SGD, RMSpropも試して比較できる）
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)  # 学習率を0.001などに変更可能
+    # 最適化手法（SGD, RMSpropも試して比較できる）(Adamが最適だった)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)  # 学習率を0.001などに変更可能(0.01が良かった)
 
     # 学習回数（epoch）
-    for epoch in range(100):  # ← epoch数を変更して精度を比較
+    for epoch in range(50):  # ← epoch数を変更して精度を比較(50回が良かった)
         output = model(X_tensor)
         loss = criterion(output.squeeze(), y_tensor)
         optimizer.zero_grad()
