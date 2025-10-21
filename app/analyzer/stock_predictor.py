@@ -1,102 +1,188 @@
-import yfinance as yf
-import torch
-import torch.nn as nn
+from copy import deepcopy
+
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import yfinance as yf
 
-# LSTMモデル定義（hidden_sizeやnum_layersはチューニング可能）
+
 class StockPredictor(nn.Module):
-    def __init__(self, input_size=1, hidden_size=64, output_size=1):  # hidden_size を変更可
+    """LSTMベースの株価予測モデル."""
+
+    def __init__(
+        self,
+        input_size: int = 1,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+        output_size: int = 1,
+    ) -> None:
         super().__init__()
-        # LSTM層の追加。num_layersを増やすと深くできる
-        self.rnn = nn.LSTM(input_size, hidden_size, num_layers=1, batch_first=True)
+        self.rnn = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.rnn(x)
         out = self.fc(out[:, -1, :])
         return out
 
-# 株価データ取得関数
-def get_stock_data(symbol, period="1y"):
-    df = yf.download(symbol, period=period)
-    prices = df["Close"].values
-    return prices
 
-# 時系列データセット作成関数
-def create_dataset(data, look_back=10):  # look_back の値を変えて過去何日使うか変更可能
+def _extract_ohlcv(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """マルチインデックス/単一インデックス両対応でOHLCVを抽出する."""
+
+    required_cols = ["Close", "Open", "High", "Low", "Volume"]
+    if df.empty:
+        return pd.DataFrame(columns=required_cols)
+
+    if isinstance(df.columns, pd.MultiIndex):
+        data = {col: df[(col, symbol)] for col in required_cols if (col, symbol) in df.columns}
+    else:
+        data = {col: df[col] for col in required_cols if col in df.columns}
+
+    result = pd.DataFrame(data).dropna()
+    missing = set(required_cols) - set(result.columns)
+    if missing:
+        raise ValueError(f"必須列が不足しています: {missing}")
+    return result
+
+
+def get_stock_data(symbol: str, period: str = "2y") -> pd.DataFrame:
+    """株価データを取得し、OHLCV列のみを返す."""
+
+    df = yf.download(symbol, period=period, progress=False)
+    ohlcv = _extract_ohlcv(df, symbol)
+    if ohlcv.empty:
+        raise ValueError("株価データが取得できませんでした。")
+    return ohlcv
+
+
+def create_dataset(data: np.ndarray, look_back: int = 30) -> tuple[np.ndarray, np.ndarray]:
+    """過去look_back日分を説明変数、翌日の終値を目的変数とするデータセットを生成."""
+
     X, Y = [], []
     for i in range(len(data) - look_back):
-        X.append(data[i:i+look_back])
-        Y.append(data[i+look_back])
+        X.append(data[i : i + look_back])
+        Y.append(data[i + look_back, 0])  # 終値を予測対象とする
     return np.array(X), np.array(Y)
 
 # 予測処理本体
-def predict(symbol):
+def predict(symbol: str) -> tuple[float, pd.DataFrame]:
+    torch.manual_seed(42)
+    np.random.seed(42)
+
     print(f"symbol: {symbol}")
-    data = get_stock_data(symbol)
-    print(f"data length: {len(data)}")
-    if len(data) == 0:
-        raise ValueError("株価データが取得できませんでした。")
+    ohlcv = get_stock_data(symbol)
+    print(f"data length: {len(ohlcv)}")
 
-    # 正規化
-    data = (data - data.min()) / (data.max() - data.min())
+    look_back = 30
+    if len(ohlcv) <= look_back:
+        raise ValueError("学習に必要な十分な日数の株価データがありません。")
 
-    # 学習する日数の設定
-    look_back = 10
-    X, y = create_dataset(data, look_back=look_back)
+    feature_min = ohlcv.min()
+    feature_max = ohlcv.max()
+    feature_range = feature_max - feature_min
+    feature_range[feature_range == 0] = 1.0
 
-    # テンソル化
-    if X.ndim == 2:
-        X_tensor = torch.tensor(X, dtype=torch.float32).unsqueeze(-1)
-    elif X.ndim == 3:
-        X_tensor = torch.tensor(X, dtype=torch.float32)
-    else:
-        raise ValueError(f"Unexpected X shape: {X.shape}")
-    y_tensor = torch.tensor(y, dtype=torch.float32)
+    normalized = (ohlcv - feature_min) / feature_range
 
-    # 隠れ層ユニット数を増減して性能確認可能
-    model = StockPredictor(hidden_size=64)
+    X, y = create_dataset(normalized.values, look_back=look_back)
+    if len(X) < 2:
+        raise ValueError("学習と検証に必要なデータが不足しています。")
 
-    # 損失関数（MSE以外にもL1Loss, HuberLossなど試せる）
+    train_size = max(1, int(len(X) * 0.8))
+    if train_size >= len(X):
+        train_size = len(X) - 1
+
+    X_train, y_train = X[:train_size], y[:train_size]
+    X_val, y_val = X[train_size:], y[train_size:]
+
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+    y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
+
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(
+        train_dataset, batch_size=min(64, len(train_dataset)), shuffle=True
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = StockPredictor(input_size=X_train_tensor.size(-1)).to(device)
+
     criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    # 最適化手法（SGD, RMSpropも試して比較できる）(Adamが最適だった)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)  # 学習率を0.001などに変更可能(0.01が良かった)
+    best_state = None
+    best_val_loss = float("inf")
+    patience = 10
+    patience_counter = 0
 
-    # 学習回数（epoch）
-    for epoch in range(50):  # ← epoch数を変更して精度を比較(50回が良かった)
-        output = model(X_tensor)
-        loss = criterion(output.squeeze(), y_tensor)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    model.train()
+    for epoch in range(200):
+        epoch_loss = 0.0
+        for batch_X, batch_y in train_loader:
+            optimizer.zero_grad()
+            output = model(batch_X.to(device)).squeeze(-1)
+            loss = criterion(output, batch_y.to(device))
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * len(batch_X)
 
-        # 10エポックごとに損失を出力して学習状態を確認
+        epoch_loss /= len(train_dataset)
+
+        model.eval()
+        with torch.no_grad():
+            val_output = model(X_val_tensor.to(device)).squeeze(-1)
+            val_loss = criterion(val_output, y_val_tensor.to(device)).item()
+
+        if val_loss + 1e-6 < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_state = deepcopy(model.state_dict())
+        else:
+            patience_counter += 1
+
         if epoch % 10 == 0:
-            print(f"Epoch {epoch}: Loss = {loss.item():.6f}")
+            print(
+                f"Epoch {epoch}: train_loss = {epoch_loss:.6f}, val_loss = {val_loss:.6f}"
+            )
 
-    # 直近データで予測
-    pred = model(X_tensor[-1:])
+        if patience_counter >= patience:
+            print("Early stopping triggered.")
+            break
+
+        model.train()
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    model.eval()
+    with torch.no_grad():
+        latest_window = torch.tensor(
+            normalized.values[-look_back:], dtype=torch.float32
+        ).unsqueeze(0)
+        pred = model(latest_window.to(device))
     pred_value = pred.item()
 
-    # 最新1ヶ月の株価を取得し、正規化を戻す
-    df = yf.download(symbol, period="1mo")
-    if isinstance(df.columns, pd.MultiIndex):
-        close_col = ('Close', symbol)
-        if close_col not in df.columns:
-            raise ValueError("1ヶ月分の株価データが取得できませんでした。")
-        close_series = df[close_col]
-        df_simple = pd.DataFrame({'Date': df.index, 'Close': close_series.values})
-    else:
-        if 'Close' not in df.columns:
-            raise ValueError("1ヶ月分の株価データが取得できませんでした。")
-        df_simple = pd.DataFrame({'Date': df.index, 'Close': df['Close'].values})
+    df_recent = yf.download(symbol, period="1mo", progress=False)
+    df_simple = _extract_ohlcv(df_recent, symbol).reset_index()
+    if "Date" not in df_simple.columns:
+        df_simple = df_simple.rename(columns={"index": "Date"})
+    if "Date" not in df_simple.columns:
+        first_col = df_simple.columns[0]
+        df_simple = df_simple.rename(columns={first_col: "Date"})
 
-    # 予測値を正規化から戻す
-    close_min = df_simple["Close"].min()
-    close_max = df_simple["Close"].max()
+    close_min = feature_min["Close"]
+    close_max = feature_max["Close"]
     pred_value_denorm = pred_value * (close_max - close_min) + close_min
-    pred_value_denorm = round(pred_value_denorm, 1)
+    pred_value_denorm = round(float(pred_value_denorm), 1)
 
-    return pred_value_denorm, df_simple
+    return pred_value_denorm, df_simple[["Date", "Close"]]
